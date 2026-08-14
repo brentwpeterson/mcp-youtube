@@ -84,10 +84,10 @@ def youtube_auth_status() -> dict[str, Any]:
 
     CALL THIS FIRST IN ANY SESSION THAT WILL WRITE.
 
-    A token bound to Brent's personal channel (@AgenticCommerceGuy, empty)
-    returns HTTP 200 on every call, and uploads land there with NO error of any
-    kind. That failure is invisible until someone goes looking on the wrong
-    channel. This tool is how it becomes visible.
+    A token bound to a personal channel that owns nothing returns HTTP 200 on
+    every call, and uploads land there with NO error of any kind. That failure
+    is invisible until someone goes looking on the wrong channel. This tool is
+    how it becomes visible.
 
     Also reports the daily quota and whether the mirrored copy of yt_write.py
     has drifted from the canonical one (they are separate inodes; editing one
@@ -379,9 +379,9 @@ def youtube_upload_captions(video_id: str, file: str, language: str = "en",
                             dry_run: bool = False) -> dict[str, Any]:
     """Attach a real caption track, replacing any existing track of the same name.
 
-    This is what puts CORRECT guest and company names on the video. YouTube's
-    ASR mangles exactly those, which is the failure Susan's SOP dedicates a
-    section to.
+    This is what puts CORRECT proper nouns on the video -- guest names, company
+    names, product names. YouTube's automatic captions mangle exactly those, and
+    they are the words most worth getting right.
 
     Args:
         video_id: The videoId to caption.

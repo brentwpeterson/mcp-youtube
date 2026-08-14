@@ -1,21 +1,17 @@
 """FastMCP singleton, the yt_write bridge, the channel guard, and the quota ledger.
 
-WHY THIS SERVER IS SEPARATE FROM THE REQUESTDESK MCP
-----------------------------------------------------
-A 134 MB video (Kate Farms; longer episodes run 400 MB+) lives on Brent's Mac.
-Routing it through app.requestdesk.ai to reach Google would be a double transfer
-into storage the API does not have. The OAuth token is likewise local, at
-`~/.config/brent-youtube/`. So the upload runs where the files and the token
-already are.
+WHY THE UPLOAD RUNS LOCALLY RATHER THAN SERVER-SIDE
+---------------------------------------------------
+Episode video files are large -- 134 MB is a short one, and an hour-long
+recording runs past 400 MB -- and they live on the operator's own machine,
+alongside the OAuth token. Routing them through an application API to reach
+Google would mean a double transfer into storage that API does not have, plus
+moving a refresh token into a server-side secret store for no gain. So the
+upload runs where the files and the token already are.
 
-This does not violate "the requestdesk MCP never touches Mongo" -- this is not
-the requestdesk MCP, and it touches no database at all. It is the same shape as
-the slack / trello / transistor / quickbooks servers: an MCP that fronts one
-vendor API.
-
-Division of labour:
-    youtube MCP     owns the UPLOAD          (this server)
-    requestdesk MCP owns the RECORD          (episode_youtube_upload -> punch_set)
+That keeps the division of labour clean for anyone pairing this with a content
+system: this server owns the UPLOAD, and the system of record owns the RECORD
+of it. It touches no database of any kind.
 
 WHY IT IMPORTS yt_write.py INSTEAD OF REIMPLEMENTING IT
 --------------------------------------------------------
@@ -41,19 +37,39 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO, format="%(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-WORKSPACE = Path("/Users/brent/scripts/CB-Workspace")
+# ---------------------------------------------------------------------------
+# Configuration -- all of it from the environment or from the wrapped module.
+# ---------------------------------------------------------------------------
+# Nothing operator-specific is hardcoded here: no home directories, no channel
+# ids, no credential paths. YT_WRITE_PATH is REQUIRED and has no default,
+# because a default path for the one file this server is a bridge over would be
+# a silent fallback over an endpoint -- exactly the pattern that hides a
+# misconfiguration until it matters.
 
-# The canonical copy and its mirror. Dirac's warning: these are two real files
-# with separate inodes, and editing one without the other is a live trap. We
-# load the canonical one and REPORT the divergence rather than picking silently
-# -- a quiet `a or b` over two credential-shaped sources is the exact pattern
-# the workspace bans.
-YT_WRITE_CANONICAL = WORKSPACE / "claude-shared/skills/youtube/yt_write.py"
-YT_WRITE_MIRROR = WORKSPACE / ".claude/skills/youtube/yt_write.py"
-TXT2SRT = WORKSPACE / "claude-shared/skills/youtube/txt2srt.py"
+def _required_env(name: str, why: str) -> str:
+    val = os.environ.get(name, "").strip()
+    if not val:
+        raise RuntimeError(
+            f"{name} is not set. {why}\n"
+            "Set it in the `env` block of this server's entry in .mcp.json."
+        )
+    return val
 
-CONFIG_DIR = Path(os.path.expanduser("~/.config/brent-youtube"))
-QUOTA_FILE = CONFIG_DIR / "quota.json"
+
+YT_WRITE_CANONICAL = Path(_required_env(
+    "YT_WRITE_PATH",
+    "It must be the absolute path to yt_write.py, the CLI this server wraps."))
+
+# Optional. Some installs keep a second copy of yt_write.py at another path;
+# they are separate inodes, so editing one and not the other is a live trap.
+# We load the canonical one and REPORT any divergence rather than picking
+# silently -- a quiet `a or b` over two sources of truth is how the wrong one
+# ends up live.
+_mirror_env = os.environ.get("YT_WRITE_MIRROR_PATH", "").strip()
+YT_WRITE_MIRROR = Path(_mirror_env) if _mirror_env else None
+
+_txt2srt_env = os.environ.get("TXT2SRT_PATH", "").strip()
+TXT2SRT = Path(_txt2srt_env) if _txt2srt_env else YT_WRITE_CANONICAL.parent / "txt2srt.py"
 
 # YouTube Data API v3 unit costs. The project cap is 10,000/day, which makes
 # videos.insert the binding constraint at 4-5 episodes per day.
@@ -88,6 +104,11 @@ def _load_module(path: Path, name: str):
 yt_write = _load_module(YT_WRITE_CANONICAL, "yt_write_ref")
 _txt2srt = None  # loaded on demand; only the srt tool needs it
 
+# Credential location comes from the wrapped module, so there is exactly one
+# definition of where the token lives rather than two that can disagree.
+CONFIG_DIR = Path(yt_write.CONFIG_DIR)
+QUOTA_FILE = CONFIG_DIR / "quota.json"
+
 
 def txt2srt_module():
     global _txt2srt
@@ -103,7 +124,11 @@ def mirror_status() -> dict[str, Any]:
             return None
         return hashlib.sha256(p.read_bytes()).hexdigest()[:12]
 
-    canon, mirror = _digest(YT_WRITE_CANONICAL), _digest(YT_WRITE_MIRROR)
+    canon = _digest(YT_WRITE_CANONICAL)
+    if YT_WRITE_MIRROR is None:
+        return {"in_sync": True, "sha": canon,
+                "note": "No YT_WRITE_MIRROR_PATH configured; nothing to compare."}
+    mirror = _digest(YT_WRITE_MIRROR)
     if mirror is None:
         return {"in_sync": False, "reason": "mirror missing", "mirror": str(YT_WRITE_MIRROR)}
     if canon != mirror:
@@ -121,12 +146,43 @@ def mirror_status() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # The channel guard -- the single most important thing in this server.
 # ---------------------------------------------------------------------------
-# A token bound to Brent's PERSONAL channel returns HTTP 200 on every call and
-# uploads land there with no error whatsoever. Dirac hit this three times on
-# 2026-08-13. Allowlist and denylist are re-exported from yt_write so there is
-# one definition, not two.
-KNOWN_CHANNELS: dict[str, str] = dict(yt_write._KNOWN)
-WRONG_CHANNELS: dict[str, str] = dict(yt_write._WRONG)
+# YouTube channels often sit under BRAND ACCOUNTS, which the OAuth chooser lists
+# as PEERS of your email rather than underneath it. Pick the personal row by
+# mistake and the token binds to a personal channel that owns nothing -- then
+# every API call returns HTTP 200 and uploads land THERE, silently. That is not
+# hypothetical; it happened three times in one afternoon before this guard
+# existed.
+#
+# The lists come from the wrapped module so there is one definition rather than
+# two that drift, and can be overridden per install without touching code.
+def _parse_channel_env(name: str) -> dict[str, str]:
+    """Parse `id=label,id=label` into a dict. Empty env -> {}."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return {}
+    out: dict[str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        cid, _, label = part.partition("=")
+        out[cid.strip()] = label.strip() or cid.strip()
+    return out
+
+
+KNOWN_CHANNELS: dict[str, str] = (
+    _parse_channel_env("YOUTUBE_ALLOWED_CHANNELS") or dict(getattr(yt_write, "_KNOWN", {})))
+WRONG_CHANNELS: dict[str, str] = (
+    _parse_channel_env("YOUTUBE_DENIED_CHANNELS") or dict(getattr(yt_write, "_WRONG", {})))
+
+if not KNOWN_CHANNELS:
+    raise RuntimeError(
+        "No allowed channels configured. Set YOUTUBE_ALLOWED_CHANNELS to "
+        "'UCxxxx=My Channel,UCyyyy=Other' or define _KNOWN in the wrapped "
+        "yt_write.py. Without an allowlist this server cannot tell a correct "
+        "upload target from a silent wrong-channel one, which is the single "
+        "failure it exists to prevent."
+    )
 
 
 class WrongChannel(RuntimeError):
@@ -154,7 +210,8 @@ def require_token() -> None:
             f"{yt_write.TOKEN_FILE}.\n"
             "This CANNOT be fixed from a tool call: the consent flow opens a browser "
             "and blocks on a localhost callback.\n"
-            "Run this in a terminal, and pick the BRAND ACCOUNT row (not 'Brent Peterson'):\n"
+            "Run this in a terminal, and pick the BRAND ACCOUNT row at the chooser "
+            "-- NOT the personal row bearing your own name:\n"
             f"  {WORKSPACE}/.claude/local/youtube-venv/bin/python "
             f"{YT_WRITE_CANONICAL} auth"
         )
@@ -280,16 +337,15 @@ def quota_guard(units: int, label: str) -> None:
             f"of {QUOTA_DAILY_LIMIT} for {cur['day']} (US Pacific).\n"
             "Refusing up front -- a failed videos.insert still burns the full 1,600 "
             "and the retry burns it again.\n"
-            "Quota rolls over at midnight Pacific. There are 26 unpublished episodes; "
-            "a full backfill is a five-day burn at 4-5 per day."
+            "Quota rolls over at midnight US Pacific. At 1,600 units per upload a "
+            "single day buys 4-5 videos, so plan a backfill across days."
         )
 
 
 mcp = FastMCP(
     "youtube",
     instructions=(
-        "Authenticated YouTube writes for Brent's channels (Talk Commerce, Content "
-        "Cucumber).\n\n"
+        "Authenticated YouTube writes: uploads, captions, playlists, metadata.\n\n"
         "ALWAYS call `youtube_auth_status` first in a session. A token bound to the "
         "wrong channel returns HTTP 200 on every call and uploads land on an empty "
         "personal channel with no error at all.\n\n"

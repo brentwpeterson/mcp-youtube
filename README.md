@@ -1,131 +1,189 @@
-# youtube MCP server
+# youtube-mcp
 
-Authenticated YouTube writes for Brent's channels: uploads, captions, playlists,
-metadata. Built 2026-08-14 from Claude-Dirac's proven CLI.
+An MCP server for **authenticated YouTube writes** — uploading videos, attaching
+real caption tracks, managing playlists, editing metadata.
 
-## Why this is its own server
+It is a thin, guarded bridge over a working `yt_write.py` CLI rather than a
+reimplementation of one, and most of what is interesting here is the guards.
+Each exists because the obvious implementation fails in a way that produces **no
+error at all**.
 
-A 134 MB video (Kate Farms; longer episodes run 400 MB+) lives on Brent's Mac,
-and so does the OAuth token. Routing the file through `app.requestdesk.ai` to
-reach Google would be a double transfer into storage the API does not have, and
-would require moving a YouTube refresh token into AWS secrets for no gain.
+## The failure this server exists to prevent
 
-This does **not** violate "the requestdesk MCP never touches Mongo" — this is not
-the requestdesk MCP, and it touches no database at all. It is the same shape as
-the slack / trello / transistor / quickbooks servers: one MCP fronting one vendor
-API.
+YouTube channels frequently live under **Brand Accounts**. At the OAuth consent
+screen, Google lists brand accounts as *peers* of your email address, not
+underneath it — so the row bearing your own name is your **personal** channel,
+which usually owns nothing.
 
-    youtube MCP      owns the UPLOAD
-    requestdesk MCP  owns the RECORD   (episode_youtube_upload -> punch_set)
+Pick that row by mistake and everything still works. The token is valid. Every
+API call returns HTTP 200. Uploads succeed. They just land on the wrong channel,
+and you find out days later.
 
-## It wraps `yt_write.py`, it does not reimplement it
+So `assert_safe_channel` runs before **every write**, not once at startup — a
+token can be replaced underneath a running process. It costs 1 quota unit to
+protect a 1,600-unit upload.
 
-    /Users/brent/scripts/CB-Workspace/claude-shared/skills/youtube/yt_write.py
+```
+youtube_auth_status()
+→ { ok: true, channels: [{ title: "…", allowed: true }], quota: {…} }
+```
 
-Every guard in that file was written after a real failure on 2026-08-13. The
-allowlist, denylist and resumable-transfer helper are imported from it so there
-is one definition rather than two that drift.
+Call it first in any session that will write.
 
-That file is **mirrored** to `.claude/skills/youtube/yt_write.py` as a separate
-inode. Editing one and not the other is a live trap, so `youtube_auth_status`
-reports a sha comparison of the two under `yt_write_mirror`.
+## Uploads are asynchronous, and that is not a style choice
 
-## The guard that matters most
+A 134 MB file takes minutes at 8 MB chunks; hour-long recordings run past
+400 MB. A synchronous tool call reports a timeout while the transfer is still
+running — and the natural response, retrying, burns a second **1,600 quota
+units** against a 10,000/day cap.
 
-A token bound to Brent's personal channel (`UCJmVHG4ZzHM-B4MuSbtpEDA`,
-@AgenticCommerceGuy, empty) returns **HTTP 200 on every call** and uploads land
-there with no error whatsoever. Dirac hit this three times.
+```
+job = youtube_upload_video(file="/abs/path.mp4", title="…")
+      → { job_id: "a1b2c3", status: "queued" }
 
-`assert_safe_channel` runs before *every* write, not just at startup — a token
-can be replaced underneath a running server. It costs 1 quota unit to protect a
-1,600-unit write.
+youtube_upload_status(job_id="a1b2c3")
+      → { status: "uploading", progress: 45 }
+      → { status: "done", verified: true, url: "https://youtu.be/…" }
+```
 
-    ALLOWED   UC5blM_aXiUhP5QCChKcjTDw   Talk Commerce
-              UCwJYSup2J2ZnmDGA0Yx_GSA   Content Cucumber
-    REFUSED   UCJmVHG4ZzHM-B4MuSbtpEDA   personal, empty
+`verified: true` appears only after a **read-back** confirms the video exists and
+is owned by this token. If you are closing a task or a checklist row on the
+strength of an upload, gate it on `verified`, not on an id coming back from the
+insert call.
 
-## Uploads are asynchronous on purpose
+Jobs are in-memory and do not survive a restart. If you lose one, check the
+channel before re-uploading.
 
-134 MB takes minutes at 8 MB chunks. A synchronous tool call reports a timeout
-while the transfer is still running, and the natural response — retry — burns a
-second 1,600 quota units.
+## Quota is the real ceiling
 
-    job = youtube_upload_video(file=..., title=...)   # returns immediately
-    youtube_upload_status(job["job_id"])              # queued|uploading|verifying|done|failed
+| Operation | Units |
+|---|---|
+| `videos.insert` | **1,600** |
+| `captions.insert` | ~400 |
+| metadata write | ~50 |
+| read / list | 1 |
 
-`verified: true` appears only after a read-back confirms the video exists. **Do
-not close a punchlist row on anything less than that.**
+Against a default 10,000/day project quota, that is **4–5 uploads per day**. A
+backfill of any size is a multi-day plan, not an afternoon.
 
-Jobs are in-memory and do not survive a server restart. If you lose one, check
-the channel before re-uploading.
+The ledger resets at midnight **US Pacific** and refuses an upload *before*
+spending when the day is gone — a `videos.insert` that dies mid-transfer still
+costs the full 1,600, and so does the retry. It counts only what this server
+spent, so treat it as a floor: usage from the CLI or another client is invisible
+to it.
 
-## Enforced server-side
+## Enforced locally, not left to the API
 
-- `privacy` defaults to **private**. Never public by default.
-- `publish_at` requires `privacy=private` (YouTube rejects it otherwise) — caught
-  locally so you get a sentence instead of an opaque 400.
-- **Max 15 tags** (SOP Step 5). The 16th is refused, never silently trimmed.
+- **`privacy` defaults to `private`.** Never public by default. Schedule with
+  `publish_at` instead of publishing straight out.
+- **`publish_at` requires `privacy=private`.** YouTube rejects it otherwise;
+  caught locally so you get a sentence instead of an opaque 400.
+- **Maximum 15 tags.** The 16th is *refused*, never silently trimmed — a quietly
+  dropped tag is worse than an error.
 
-## Quota
-
-`videos.insert` costs 1,600 of 10,000/day, so the ceiling is **4–5 episodes per
-day**. 26 unpublished episodes is a five-day burn.
-
-The ledger at `~/.config/brent-youtube/quota.json` resets at midnight US Pacific
-and refuses an upload *before* spending when the day is gone. It counts only
-what this server spent, so treat it as a floor — CLI usage is invisible to it.
-
-## What this server deliberately does NOT do
+## What it deliberately does not do
 
 **End screens and info cards.** They are not in the YouTube Data API at all —
-Studio-only, permanently. The SOP requires both on every episode and every short,
-so that step always ends with a manual pass. A tool claiming to do it would be
-lying, so there isn't one.
-
-## Auth
-
-Credentials live at `~/.config/brent-youtube/{client_secret.json,token.json}`,
-chmod 600. Scopes: `youtube`, `youtube.force-ssl`, `youtube.upload`.
-
-**`auth` cannot run from a tool call** — it opens a browser and blocks on a
-localhost callback, which would hang the MCP client. When the token is missing,
-tools return an actionable error instead. A human runs this in a terminal:
-
-    /Users/brent/scripts/CB-Workspace/.claude/local/youtube-venv/bin/python \
-      /Users/brent/scripts/CB-Workspace/claude-shared/skills/youtube/yt_write.py auth
-
-At the chooser, pick the **BRAND ACCOUNT** row (`Content Basis` → Talk Commerce),
-never the personal `Brent Peterson` row.
+Studio-only, permanently. Any tool claiming to set them would be lying, so there
+isn't one. `youtube_upload_status` returns a `still_manual` reminder instead.
 
 ## Tools
 
 | Tool | Notes |
 |---|---|
-| `youtube_auth_status` | **Call first.** Bound channel, allowlist verdict, quota, mirror drift |
+| `youtube_auth_status` | **Call first.** Bound channel, allowlist verdict, quota |
 | `youtube_quota_status` | Spent / remaining / uploads still affordable |
-| `youtube_upload_video` | Async; returns a job_id |
-| `youtube_upload_status` | Poll a job; `verified` gates the punch row |
+| `youtube_upload_video` | Async; returns a `job_id` |
+| `youtube_upload_status` | Poll a job; `verified` is the gate |
 | `youtube_upload_captions` | `.srt`/`.sbv`/`.vtt`; replaces a same-named track |
-| `youtube_transcript_to_srt` | Riverside `.txt` → `.srt` via `txt2srt.py` |
+| `youtube_transcript_to_srt` | Speaker-timestamped `.txt` → `.srt` |
 | `youtube_get_video` | Read metadata |
 | `youtube_update_video` | Partial edit; unpassed fields keep their values |
 | `youtube_playlist_list` | |
 | `youtube_playlist_create` | Idempotent by title |
 | `youtube_playlist_add` | Skips a video already present |
 
-## Playlists worth knowing
+## Install
 
-    eTail Boston 2026   PLH3zTxT_1WVM
-    Videos (SOP Step 5) PLFSxOzvLTxf9omUNTgse-3HL99Tvv-IYO
-    Shorts              PLFSxOzvLTxf8LnR96lllwsPIHjRjS9VBY
-    Talk Commerce       PLFSxOzvLTxf-zJhT4K7HAz-LiVFmDJ_Ak
+Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and a `yt_write.py`
+CLI exposing `_service()`, `_resumable()` and channel constants.
 
-Shorts need no special handling — YouTube classifies by vertical aspect ratio
-plus runtime under three minutes. Point `playlist_id` at Shorts.
+```bash
+uv sync
+```
 
-## Run
+Add to `.mcp.json`:
 
-    uv run --directory /Users/brent/scripts/CB-Workspace/mcp-servers/youtube \
-      python -m youtube_mcp
+```json
+{
+  "mcpServers": {
+    "youtube": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/youtube-mcp", "python", "-m", "youtube_mcp"],
+      "env": {
+        "YT_WRITE_PATH": "/path/to/yt_write.py"
+      }
+    }
+  }
+}
+```
 
-Registered in `.mcp.json` as `youtube`. Requires a Claude Code restart to appear.
+### Configuration
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `YT_WRITE_PATH` | **yes** | Absolute path to the `yt_write.py` this server wraps |
+| `YT_WRITE_MIRROR_PATH` | no | A second copy to sha-compare against (see below) |
+| `TXT2SRT_PATH` | no | Defaults to `txt2srt.py` beside `YT_WRITE_PATH` |
+| `YOUTUBE_ALLOWED_CHANNELS` | no | `UCxxx=Label,UCyyy=Label`; defaults to `_KNOWN` in the wrapped module |
+| `YOUTUBE_DENIED_CHANNELS` | no | Same format; channels to hard-reject |
+
+`YT_WRITE_PATH` has no default on purpose. A default path for the one file this
+server bridges would be a silent fallback over an endpoint — the class of bug
+that hides a misconfiguration until it matters.
+
+If your setup keeps two copies of `yt_write.py` at different paths, set
+`YT_WRITE_MIRROR_PATH`. They are separate inodes, so editing one and not the
+other is a live trap; `youtube_auth_status` sha-compares them and reports drift
+rather than picking one silently.
+
+At least one allowed channel must resolve, or the server refuses to start —
+without an allowlist it cannot distinguish a correct upload target from a
+silently wrong one, which is the whole point.
+
+## Auth
+
+Credentials live wherever the wrapped `yt_write.py` puts them (`CONFIG_DIR`),
+typically `client_secret.json` + `token.json` at chmod 600. Scopes: `youtube`,
+`youtube.force-ssl`, `youtube.upload`.
+
+**`auth` cannot run from a tool call.** It opens a browser and blocks on a
+localhost callback, which would hang the MCP client with no way out. When the
+token is missing, tools return an actionable error naming the command a human
+should run:
+
+```bash
+python /path/to/yt_write.py auth
+```
+
+At the chooser, pick the **Brand Account** row — never the personal row bearing
+your own name.
+
+Two related traps worth knowing: Brand Accounts are not members of a Workspace
+org, so an **Internal** OAuth app returns `Error 403: org_internal` — the app
+must be **External**. And it must be **published to Production**; Testing mode
+expires refresh tokens every 7 days.
+
+## Implementation note: stdout is the transport
+
+MCP stdio servers speak JSON-RPC on stdout. The wrapped CLI prints constantly —
+progress lines, banners, reminders — so **one stray print corrupts the stream**
+and the client drops the connection. Every call into that module runs inside a
+`redirect_stdout` buffer, surfaced as `cli_output` where it is useful.
+
+If you fork this to wrap a different CLI, that is the part to keep.
+
+## License
+
+MIT

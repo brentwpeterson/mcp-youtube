@@ -495,28 +495,46 @@ def youtube_get_video(video_id: str) -> dict[str, Any]:
 def youtube_update_video(video_id: str, title: str | None = None,
                          description: str | None = None,
                          tags: list[str] | None = None,
+                         privacy: str | None = None,
+                         publish_at: str | None = None,
                          dry_run: bool = False) -> dict[str, Any]:
-    """Edit a video's title, description or tags.
+    """Edit a video's title, description, tags, visibility or publish schedule.
 
-    videos.update replaces the whole snippet, so this reads the current one
-    first and changes only the fields you pass. Omitted fields keep their
-    values rather than being blanked.
+    videos.update replaces whole parts, so this reads the current snippet and
+    status first and changes only the fields you pass. Omitted fields keep
+    their values rather than being blanked.
+
+    Title/description/tags live in part="snippet"; privacy and scheduling live
+    in part="status". This tool used to send snippet only, which meant an
+    already-uploaded video could not be made public or scheduled at all --
+    the gap that sent a session writing throwaway scripts on 2026-08-25.
+
+    `privacy`: private | unlisted | public.
+    `publish_at`: ISO8601 UTC, e.g. 2026-09-01T13:00:00Z. YouTube REQUIRES
+    privacyStatus=private for publishAt, so this forces private for you rather
+    than letting the API return an opaque 400. An unlisted video therefore
+    cannot be scheduled without going private first, which this handles.
     """
     try:
-        if title is None and description is None and tags is None:
-            raise ValueError("Nothing to change. Pass title, description or tags.")
+        if (title is None and description is None and tags is None
+                and privacy is None and publish_at is None):
+            raise ValueError("Nothing to change. Pass title, description, "
+                             "tags, privacy or publish_at.")
+        if privacy is not None and privacy not in ("private", "unlisted", "public"):
+            raise ValueError(f"privacy must be private, unlisted or public; got {privacy!r}.")
         if tags is not None and len(tags) > MAX_TAGS:
             raise ValueError(f"{len(tags)} tags exceeds the house limit of {MAX_TAGS}.")
         yt = service()
         with _quiet():
             assert_safe_channel(yt)
-            resp = yt.videos().list(part="snippet", id=video_id).execute()
+            resp = yt.videos().list(part="snippet,status", id=video_id).execute()
         quota_charge(COST_READ * 2, "videos.list + guard")
         items = resp.get("items", [])
         if not items:
             return {"ok": False, "error": "not_found",
                     "message": f"No video {video_id} (or this token does not own it)."}
         sn = items[0]["snippet"]
+        st = items[0].get("status", {})
         new = {"title": sn.get("title"), "categoryId": sn.get("categoryId"),
                "description": sn.get("description", ""), "tags": sn.get("tags", [])}
         if sn.get("defaultLanguage"):
@@ -530,12 +548,41 @@ def youtube_update_video(video_id: str, title: str | None = None,
             new["description"] = description
         if tags is not None:
             changes["tags"] = [new["tags"], tags]; new["tags"] = tags
+        # Status is a separate part. Carry the current flags forward so a
+        # privacy change cannot silently reset embeddable/license/made-for-kids.
+        status_body = None
+        if privacy is not None or publish_at is not None:
+            status_body = {
+                "selfDeclaredMadeForKids": st.get("selfDeclaredMadeForKids", False),
+                "license": st.get("license", "youtube"),
+                "embeddable": st.get("embeddable", True),
+                "publicStatsViewable": st.get("publicStatsViewable", True),
+            }
+            if publish_at is not None:
+                # YouTube rejects publishAt on anything but private.
+                status_body["privacyStatus"] = "private"
+                status_body["publishAt"] = publish_at
+                changes["publish_at"] = [st.get("publishAt"), publish_at]
+                changes["privacy"] = [st.get("privacyStatus"), "private"]
+                if privacy is not None and privacy != "private":
+                    changes["privacy_ignored"] = (
+                        f"{privacy} ignored; publish_at requires private")
+            else:
+                status_body["privacyStatus"] = privacy
+                changes["privacy"] = [st.get("privacyStatus"), privacy]
+
+        snippet_changed = title is not None or description is not None or tags is not None
         if dry_run:
             return {"ok": True, "dry_run": True, "id": video_id, "changes": changes}
         with _quiet():
-            yt.videos().update(part="snippet",
-                               body={"id": video_id, "snippet": new}).execute()
-        quota_charge(COST_WRITE, f"videos.update {video_id}")
+            if snippet_changed:
+                yt.videos().update(part="snippet",
+                                   body={"id": video_id, "snippet": new}).execute()
+                quota_charge(COST_WRITE, f"videos.update snippet {video_id}")
+            if status_body is not None:
+                yt.videos().update(part="status",
+                                   body={"id": video_id, "status": status_body}).execute()
+                quota_charge(COST_WRITE, f"videos.update status {video_id}")
         return {"ok": True, "id": video_id, "changes": changes, "quota": quota_read()}
     except Exception as exc:
         return _fail(exc)

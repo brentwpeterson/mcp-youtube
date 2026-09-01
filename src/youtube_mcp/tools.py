@@ -153,8 +153,13 @@ _jobs_lock = threading.Lock()
 
 
 def _job_set(job_id: str, **fields) -> None:
+    # The job dict carries its own id so youtube_upload_status can return a
+    # self-describing record. Seeding it here rather than letting the caller
+    # pass job_id=... is deliberate: doing that collides with the positional
+    # parameter and raises "got multiple values for argument 'job_id'", which
+    # is what happened on every single upload attempt until 2026-09-01.
     with _jobs_lock:
-        _jobs.setdefault(job_id, {}).update(fields)
+        _jobs.setdefault(job_id, {"job_id": job_id}).update(fields)
 
 
 def _job_get(job_id: str) -> dict[str, Any] | None:
@@ -335,7 +340,7 @@ def youtube_upload_video(
         quota_charge(COST_READ, "channels.list guard")
 
         job_id = uuid.uuid4().hex[:12]
-        _job_set(job_id, job_id=job_id, status="queued", progress=0, file=file,
+        _job_set(job_id, status="queued", progress=0, file=file,
                  size_mb=round(size_mb, 1), title=title, privacy=privacy,
                  started_at=datetime.now(timezone.utc).isoformat())
         threading.Thread(target=_run_upload, daemon=True,

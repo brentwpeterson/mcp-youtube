@@ -98,6 +98,7 @@ isn't one. `youtube_upload_status` returns a `still_manual` reminder instead.
 | `youtube_upload_captions` | `.srt`/`.sbv`/`.vtt`; replaces a same-named track |
 | `youtube_transcript_to_srt` | Speaker-timestamped `.txt` → `.srt` |
 | `youtube_get_video` | Read metadata |
+| `youtube_list_channel_videos` | Whole catalog to a JSON file (tags, chapters, captions, playlists, stats); returns counts. ~1 unit per 50 videos |
 | `youtube_update_video` | Partial edit; unpassed fields keep their values |
 | `youtube_playlist_list` | |
 | `youtube_playlist_create` | Idempotent by title |

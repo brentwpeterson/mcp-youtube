@@ -496,6 +496,138 @@ def youtube_get_video(video_id: str) -> dict[str, Any]:
         return _fail(exc)
 
 
+_CHAPTER_START = ("0:00", "00:00")
+
+
+def _iso_seconds(duration: str) -> int:
+    """PT1H2M3S -> 3723. YouTube durations never carry days for uploads."""
+    import re
+    m = re.fullmatch(r"P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", duration or "")
+    if not m:
+        return 0
+    d, h, mi, s = (int(x or 0) for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60 + s
+
+
+@mcp.tool()
+def youtube_list_channel_videos(output_file: str,
+                                include_playlists: bool = True) -> dict[str, Any]:
+    """Every video on the bound channel, written to a JSON file for auditing.
+
+    Read-only. The full catalog (947+ videos with descriptions) is far too large
+    to return through a tool call, so rows go to `output_file` and the result
+    carries counts only.
+
+    The channel guard runs first even though this never writes: `mine=True` on a
+    token bound to an empty personal channel returns an empty list with HTTP 200,
+    and an audit of zero videos would read as a clean bill of health.
+
+    Cost: about 1 unit per 50 videos for the upload list, 1 per 50 for details,
+    plus 1 per 50 playlist items when include_playlists is on. Roughly 40-60
+    units for ~950 videos.
+    """
+    try:
+        out = Path(output_file).expanduser()
+        if not out.parent.is_dir():
+            return {"ok": False, "error": "bad_output_file",
+                    "message": f"Directory does not exist: {out.parent}"}
+        yt = service()
+        units = 0
+        with _quiet():
+            chans = assert_safe_channel(yt)
+            units += 1
+            ch = yt.channels().list(part="contentDetails,snippet", mine=True).execute()
+            units += 1
+        ch_item = ch["items"][0]
+        uploads = ch_item["contentDetails"]["relatedPlaylists"]["uploads"]
+
+        def _playlist_ids(pid: str) -> list[str]:
+            nonlocal units
+            ids, token = [], None
+            while True:
+                with _quiet():
+                    resp = yt.playlistItems().list(
+                        part="contentDetails", playlistId=pid, maxResults=50,
+                        pageToken=token).execute()
+                units += 1
+                ids += [it["contentDetails"]["videoId"] for it in resp.get("items", [])]
+                token = resp.get("nextPageToken")
+                if not token:
+                    return ids
+
+        video_ids = _playlist_ids(uploads)
+
+        membership: dict[str, list[str]] = {}
+        if include_playlists:
+            token = None
+            while True:
+                with _quiet():
+                    pl = yt.playlists().list(part="snippet", mine=True, maxResults=50,
+                                             pageToken=token).execute()
+                units += 1
+                for p in pl.get("items", []):
+                    for vid in _playlist_ids(p["id"]):
+                        membership.setdefault(vid, []).append(p["snippet"]["title"])
+                token = pl.get("nextPageToken")
+                if not token:
+                    break
+
+        rows = []
+        for i in range(0, len(video_ids), 50):
+            with _quiet():
+                resp = yt.videos().list(
+                    part="snippet,status,contentDetails,statistics",
+                    id=",".join(video_ids[i:i + 50]), maxResults=50).execute()
+            units += 1
+            for v in resp.get("items", []):
+                sn, st = v["snippet"], v.get("status", {})
+                cd, stats = v.get("contentDetails", {}), v.get("statistics", {})
+                desc = sn.get("description", "")
+                rows.append({
+                    "id": v["id"],
+                    "url": f"https://youtu.be/{v['id']}",
+                    "title": sn.get("title"),
+                    "published_at": sn.get("publishedAt"),
+                    "privacy": st.get("privacyStatus"),
+                    "duration_seconds": _iso_seconds(cd.get("duration", "")),
+                    "caption": cd.get("caption") == "true",
+                    "tags": sn.get("tags", []),
+                    "category_id": sn.get("categoryId"),
+                    "default_language": sn.get("defaultLanguage"),
+                    "description": desc,
+                    "description_len": len(desc),
+                    "has_chapters": any(line.strip().startswith(_CHAPTER_START)
+                                        for line in desc.splitlines()),
+                    "views": int(stats.get("viewCount", 0) or 0),
+                    "likes": int(stats.get("likeCount", 0) or 0),
+                    "comments": int(stats.get("commentCount", 0) or 0),
+                    "playlists": membership.get(v["id"], []),
+                })
+        quota_charge(COST_READ * units, f"channel video list ({len(rows)} videos)")
+
+        out.write_text(json.dumps({
+            "channel": {"id": ch_item["id"], "title": ch_item["snippet"]["title"]},
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "videos": rows,
+        }, indent=1))
+
+        missing = len(video_ids) - len(rows)
+        return {"ok": True, "channel": ch_item["snippet"]["title"],
+                "output_file": str(out), "videos": len(rows),
+                "upload_ids_listed": len(video_ids),
+                "not_returned_by_videos_list": missing,
+                "no_tags": sum(1 for r in rows if not r["tags"]),
+                "no_chapters": sum(1 for r in rows if not r["has_chapters"]),
+                "no_captions": sum(1 for r in rows if not r["caption"]),
+                "no_playlist": (sum(1 for r in rows if not r["playlists"])
+                                if include_playlists else None),
+                "privacy": {p: sum(1 for r in rows if r["privacy"] == p)
+                            for p in {r["privacy"] for r in rows}},
+                "units_spent": units, "quota": quota_read()}
+    except Exception as exc:
+        return _fail(exc)
+
+
 @mcp.tool()
 def youtube_update_video(video_id: str, title: str | None = None,
                          description: str | None = None,

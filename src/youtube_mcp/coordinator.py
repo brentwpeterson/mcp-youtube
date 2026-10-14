@@ -212,7 +212,7 @@ def require_token() -> None:
             "and blocks on a localhost callback.\n"
             "Run this in a terminal, and pick the BRAND ACCOUNT row at the chooser "
             "-- NOT the personal row bearing your own name:\n"
-            f"  {WORKSPACE}/.claude/local/youtube-venv/bin/python "
+            f"  {sys.executable} "
             f"{YT_WRITE_CANONICAL} auth"
         )
 
